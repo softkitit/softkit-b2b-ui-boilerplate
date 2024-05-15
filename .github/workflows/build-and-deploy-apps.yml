@@ -1,0 +1,119 @@
+name: Build and deploy apps
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      environment:
+        required: true
+        type: choice
+        options:
+          - dev
+          - stage
+          - prod
+        description: "Environment to apply changes to"
+        default: "dev"
+
+env:
+  BRANCH_NAME: ${{ github.head_ref || github.ref_name }}
+
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.define-envs.outputs.environment }}
+      release-tag: ${{ steps.define-envs.outputs.release-tag }}
+      is-dev: ${{ steps.define-envs.outputs.is-dev }}
+      is-release: ${{ steps.define-envs.outputs.is-release }}
+
+    steps:
+      - name: Base env info
+        run: |
+          echo BRANCH_SLUG="$(echo '${{ env.BRANCH_NAME }}' | sed 's/[^a-zA-Z0-9]/-/g')" >> $GITHUB_ENV
+          echo ENVIRONMENT=${{ inputs.environment || 'dev' }} >> $GITHUB_ENV
+
+      - name: Define envs information
+        id: define-envs
+        run: |
+          echo image-tag=${{ startsWith(env.BRANCH_NAME, 'release/') && env.BRANCH_SLUG || format('{0}-{1}', github.run_id, github.run_attempt) }} >> $GITHUB_OUTPUT
+          echo environment=${{ env.ENVIRONMENT }} >> $GITHUB_OUTPUT
+          echo is-dev=${{ env.ENVIRONMENT == 'dev' && 'true' || '' }} >> $GITHUB_OUTPUT
+          echo is-release=${{ startsWith(env.BRANCH_NAME, 'release/') && 'true' || '' }} >> $GITHUB_OUTPUT
+
+  build-apps:
+    needs: [ prepare ]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BRANCH_NAME }}
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+
+      - name: Install environment
+        run: yarn install
+
+      - name: Build apps and libraries
+        run: yarn build
+
+#      readme needed because of limitation of upload artifact action
+#      https://github.com/actions/upload-artifact/issues/174
+      - name: Upload builds
+        uses: actions/upload-artifact@v4
+        with:
+          name: build
+          path: |
+            dist
+            README.md
+          if-no-files-found: error
+
+  apply-tf-app-changes:
+    needs: [ prepare, build-apps ]
+    uses: softkitit/github-actions-terraform/.github/workflows/cd-apply-terraform-changes.yml@main
+    with:
+      environment: ${{ needs.prepare.outputs.environment }}
+      terraform-folder: terraform
+    secrets: inherit
+
+  deploy-app:
+    needs: [ prepare, build-apps ]
+    uses: softkitit/github-actions-terraform/.github/workflows/cd-deploy-to-ecs.yml@main
+    with:
+      environment: ${{ needs.prepare.outputs.environment }}
+      s3-bucket: ${{ secrets.S3_BUCKET }}
+    secrets: inherit
+
+  mark-release:
+    needs: [ prepare, deploy-app ]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BRANCH_NAME }}
+          fetch-depth: 0
+      - name: Mark release
+        run: |
+          git config --local user.email "${{ github.actor_id }}+${{ github.actor }}@users.noreply.github.com"
+          git config --local user.name "GitHub Auto Release"
+          echo "Marking release ${{ needs.prepare.outputs.release-tag }}"
+          git tag -fa ${{ needs.prepare.outputs.release-tag }} -m "Release ${{ needs.prepare.outputs.release-tag }}"
+          git push origin ${{ needs.prepare.outputs.release-tag }} --force --no-verify
+          echo "Release ${{ needs.prepare.outputs.release-tag }} marked"
+
+
+
+
+
+
